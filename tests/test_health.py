@@ -182,3 +182,18 @@ def test_bearer_scheme_case_insensitive(client):
         assert r.json()["model"] == "test-model"
     assert c.get("/health", headers={"Authorization": f"bearer {TOKEN}x"}).json() == {"status": "ok"}
     assert c.get("/health", headers={"Authorization": f"Basic {TOKEN}"}).json() == {"status": "ok"}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="known gap: validator accepts internal control characters/newlines, which "
+    "no HTTP Authorization header can carry, so the token silently never matches",
+)
+def test_health_token_with_internal_control_chars_rejected(monkeypatch):
+    from pydantic import ValidationError
+
+    from app.config import get_settings
+
+    monkeypatch.setenv("HEALTH_TOKEN", "k3J9xQ2mZ7vB1nL8wR4tY6u\nP0cD5aF_h")
+    with pytest.raises(ValidationError):
+        get_settings()

@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -306,3 +307,47 @@ def test_drifted_fingerprint_parses_once(tmp_path, monkeypatch):
     assert len(calls) == 1
     InMemoryIndex(str(tmp_path)).add(["c"])  # new fingerprint => recount
     assert ing.read_index_size(str(tmp_path)) == 3
+
+
+def test_corrupt_index_health_reports_null_index_size(index_dir):
+    # Tester addition: an unreadable index must surface as null, not a stale number.
+    ingest(["a"], InMemoryIndex(index_dir), index_dir)
+    open(f"{index_dir}/index.json", "w").write("{bad json")
+    body = TestClient(app).get("/health", headers=AUTH).json()
+    assert body["status"] == "ok"
+    assert body["index_size"] is None
+
+
+@pytest.mark.parametrize("bad_size", [-1, True, "7", None])
+def test_invalid_recorded_size_falls_back_to_count(index_dir, bad_size):
+    # Tester addition: a non-trustworthy index_size in meta must not be returned as-is.
+    from app.index import index_signature
+
+    InMemoryIndex(index_dir).add(["a", "b"])
+    sig = index_signature(Path(index_dir) / "index.json")
+    meta = {"last_ingest_at": "2024-01-01T00:00:00+00:00", "index_size": bad_size, "index_sig": sig}
+    open(f"{index_dir}/meta.json", "w").write(json.dumps(meta))
+    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == 2
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="known gap: ingest CLI does not catch IndexLockTimeout (raw traceback, exit 1)",
+)
+def test_cli_lock_timeout_reports_clean_error(index_dir, tmp_path, monkeypatch, capsys):
+    import fcntl
+    import os
+
+    import app.index as idx
+
+    monkeypatch.setattr(idx, "LOCK_TIMEOUT_SECONDS", 0.2)
+    docs = tmp_path / "d.txt"
+    docs.write_text("x\n")
+    fd = os.open(f"{index_dir}/.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        assert main(["app.ingest", str(docs)]) == 1
+    finally:
+        os.close(fd)
+    err = capsys.readouterr().err
+    assert "timed out" in err and "Traceback" not in err
