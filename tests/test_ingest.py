@@ -8,17 +8,21 @@ from app.index import IndexCorruptError, InMemoryIndex
 from app.ingest import ingest, main, read_last_ingest
 from app.main import app
 
+TOKEN = "tttttttttttttttttttttttttttttttt"
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
 
 @pytest.fixture
 def index_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("INDEX_DIR", str(tmp_path))
     monkeypatch.delenv("MODEL_NAME", raising=False)
     monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("HEALTH_TOKEN", TOKEN)
     return str(tmp_path)
 
 
 def test_default_model_name_when_env_unset(index_dir):
-    body = TestClient(app).get("/health").json()
+    body = TestClient(app).get("/health", headers=AUTH).json()
     assert body["model"] == "claude-sonnet-5-5"
 
 
@@ -26,7 +30,7 @@ def test_index_size_accumulates_across_ingests(index_dir):
     ingest(["a", "b"], InMemoryIndex(index_dir), index_dir)
     first = read_last_ingest(index_dir)
     ingest(["c"], InMemoryIndex(index_dir), index_dir)
-    body = TestClient(app).get("/health").json()
+    body = TestClient(app).get("/health", headers=AUTH).json()
     assert body["index_size"] == 3
     assert body["last_ingest_at"] >= first
 
@@ -37,7 +41,7 @@ def test_corrupt_index_raises_and_is_not_overwritten(index_dir):
     with pytest.raises(IndexCorruptError):
         InMemoryIndex(index_dir)
     # health does not touch the index, so it still works
-    assert TestClient(app).get("/health").status_code == 200
+    assert TestClient(app).get("/health", headers=AUTH).status_code == 200
     assert open(p).read() == "{not json"
 
 
@@ -54,7 +58,7 @@ def test_cli_corrupt_index_fails_without_overwrite(index_dir, tmp_path, capsys):
 def test_write_is_atomic_no_temp_files_left(index_dir, monkeypatch):
     ingest(["a"], InMemoryIndex(index_dir), index_dir)
     import os
-    assert sorted(os.listdir(index_dir)) == ["index.json", "meta.json"]
+    assert sorted(os.listdir(index_dir)) == [".lock", "index.json", "meta.json"]
     idx = InMemoryIndex(index_dir)
 
     def fail(*a, **k):
@@ -98,7 +102,7 @@ def test_cli_rejects_directory(index_dir, tmp_path, capsys):
 
 def test_corrupt_meta_file_reports_null_last_ingest(index_dir):
     (open(f"{index_dir}/meta.json", "w")).write("garbage")
-    body = TestClient(app).get("/health").json()
+    body = TestClient(app).get("/health", headers=AUTH).json()
     assert body["last_ingest_at"] is None
 
 
@@ -147,3 +151,72 @@ def test_cli_non_utf8_input_fails(index_dir, tmp_path, capsys):
     assert main(["app.ingest", str(bad)]) == 1
     assert "error" in capsys.readouterr().err
     assert InMemoryIndex(index_dir).size() == 0
+
+
+def test_legacy_meta_without_index_size_falls_back_to_count(index_dir):
+    open(f"{index_dir}/index.json", "w").write('["x", "y"]')
+    open(f"{index_dir}/meta.json", "w").write('{"last_ingest_at": "2024-01-01T00:00:00+00:00"}')
+    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == 2
+
+
+def test_direct_add_after_ingest_does_not_leave_stale_size(index_dir):
+    # Tester repro: index.json changes without meta.json being updated.
+    ingest(["a"], InMemoryIndex(index_dir), index_dir)
+    InMemoryIndex(index_dir).add(["b", "c"])
+    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == 3
+
+
+def test_crash_between_index_and_meta_writes_is_consistent(index_dir, monkeypatch):
+    ingest(["a"], InMemoryIndex(index_dir), index_dir)
+
+    def boom(path, text):
+        raise OSError("simulated crash")
+
+    import app.ingest as ing
+
+    monkeypatch.setattr(ing, "atomic_write_text", boom)
+    with pytest.raises(OSError):
+        ingest(["b", "c"], InMemoryIndex(index_dir), index_dir)
+    monkeypatch.undo()
+    monkeypatch.setenv("INDEX_DIR", index_dir)
+    monkeypatch.setenv("HEALTH_TOKEN", TOKEN)
+    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == 3
+
+
+def test_concurrent_ingests_do_not_drop_documents(index_dir):
+    import threading
+
+    n_threads, per = 8, 5
+    start = threading.Barrier(n_threads)
+    errors = []
+
+    def work(i):
+        try:
+            idx = InMemoryIndex(index_dir)  # all start from the same (empty) snapshot
+            start.wait()
+            ingest([f"t{i}-{j}" for j in range(per)], idx, index_dir)
+        except BaseException as e:  # pragma: no cover
+            errors.append(e)
+
+    ts = [threading.Thread(target=work, args=(i,)) for i in range(n_threads)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errors
+    assert InMemoryIndex(index_dir).size() == n_threads * per
+    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == n_threads * per
+
+
+def test_concurrent_processes_do_not_drop_documents(index_dir, tmp_path_factory):
+    import subprocess
+    import sys
+
+    src = tmp_path_factory.mktemp("src")
+    procs = []
+    for i in range(4):
+        f = src / f"in{i}.txt"
+        f.write_text("\n".join(f"p{i}-{j}" for j in range(5)))
+        procs.append(
+            subprocess.Popen([sys.executable, "-m", "app.ingest", str(f)], stdout=subprocess.DEVNULL)
+        )
+    assert all(p.wait() == 0 for p in procs)
+    assert InMemoryIndex(index_dir).size() == 20

@@ -20,16 +20,16 @@ def create_app() -> FastAPI:
     @app.get("/health")
     def health(authorization: Optional[str] = Header(default=None)) -> dict:
         settings = get_settings()
+        # No token configured => always minimal, regardless of APP_ENV.
+        detailed = False
         if settings.health_token:
             expected = f"Bearer {settings.health_token}"
             detailed = authorization is not None and secrets.compare_digest(
                 authorization.encode(), expected.encode()
             )
-        else:
-            detailed = settings.is_dev
         if not detailed:
             return {"status": "ok"}
-        # Reads small meta.json only; never loads the index.
+        # Normally reads only the small meta.json; see read_index_size.
         return {
             "status": "ok",
             "model": settings.model_name,

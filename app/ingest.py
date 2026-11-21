@@ -5,7 +5,14 @@ from pathlib import Path
 from typing import List, Optional
 
 from app.config import get_settings
-from app.index import IndexCorruptError, InMemoryIndex, VectorIndex, atomic_write_text
+from app.index import (
+    IndexCorruptError,
+    InMemoryIndex,
+    VectorIndex,
+    atomic_write_text,
+    index_lock,
+    index_signature,
+)
 
 
 def meta_path(index_dir: str) -> Path:
@@ -24,10 +31,32 @@ def read_last_ingest(index_dir: str) -> Optional[str]:
     return _read_meta(index_dir).get("last_ingest_at")
 
 
-def read_index_size(index_dir: str) -> int:
-    """Cheap size lookup from meta.json; never loads the index."""
-    size = _read_meta(index_dir).get("index_size", 0)
-    return size if isinstance(size, int) and size >= 0 else 0
+def read_index_size(index_dir: str) -> Optional[int]:
+    """Index size, cheaply when possible.
+
+    meta.json records index_size plus a fingerprint of index.json. If the
+    fingerprint matches, the recorded size is trusted (no index load). If it
+    does not (crash between the two writes, InMemoryIndex.add called directly,
+    legacy meta without index_size) we count from index.json itself, so the
+    value can never be stale. Returns None if the index is unreadable.
+    """
+    index_path = Path(index_dir) / "index.json"
+    sig = index_signature(index_path)
+    if sig is None:
+        return 0
+    meta = _read_meta(index_dir)
+    size = meta.get("index_size")
+    if (
+        isinstance(size, int)
+        and not isinstance(size, bool)
+        and size >= 0
+        and meta.get("index_sig") == sig
+    ):
+        return size
+    try:
+        return InMemoryIndex(index_dir).size()
+    except IndexCorruptError:
+        return None
 
 
 def ingest(docs: List[str], index: VectorIndex, index_dir: str) -> Optional[str]:
@@ -37,12 +66,19 @@ def ingest(docs: List[str], index: VectorIndex, index_dir: str) -> Optional[str]
     """
     if not docs:
         return read_last_ingest(index_dir)
-    index.add(docs)
-    ts = datetime.now(timezone.utc).isoformat()
-    atomic_write_text(
-        meta_path(index_dir),
-        json.dumps({"last_ingest_at": ts, "index_size": index.size()}),
-    )
+    with index_lock(index_dir):
+        index.add(docs)
+        ts = datetime.now(timezone.utc).isoformat()
+        atomic_write_text(
+            meta_path(index_dir),
+            json.dumps(
+                {
+                    "last_ingest_at": ts,
+                    "index_size": index.size(),
+                    "index_sig": index_signature(Path(index_dir) / "index.json"),
+                }
+            ),
+        )
     return ts
 
 
