@@ -33,7 +33,7 @@ Config via env:
 | `MODEL_NAME` | `claude-sonnet-5-5` | Model name reported by `/health` |
 | `INDEX_DIR` | `./data` | Where `index.json` / `meta.json` live |
 | `APP_ENV` | `production` | `development` enables `/docs`, `/redoc`, `/openapi.json`. Has no effect on `/health` detail |
-| `HEALTH_TOKEN` | unset | Min 32 chars (startup/validation error otherwise). If set, `/health` returns details only with `Authorization: Bearer <token>`; if unset, `/health` is always `{"status": "ok"}` |
+| `HEALTH_TOKEN` | unset | Min 32 chars, >= 8 distinct characters, no leading/trailing whitespace (startup error otherwise; the value is never echoed). Scheme is case-insensitive. If set, `/health` returns details only with `Authorization: Bearer <token>`; if unset, `/health` is always `{"status": "ok"}` |
 | `MAX_INGEST_BYTES` | `10485760` | Max size of an ingest input file |
 
 A corrupt `index.json` makes ingest fail with an error instead of being reset;
@@ -42,7 +42,12 @@ fix or remove the file manually.
 Ingest documents (one per line): `python -m app.ingest docs.txt`. Ingests take an exclusive
 lock (`<INDEX_DIR>/.lock`, `fcntl.flock`, POSIX only) so concurrent runs do not drop documents.
 `/health` trusts the `index_size` in `meta.json` only if it matches a fingerprint of `index.json`;
-otherwise (legacy meta, crash between writes, direct `add`) it counts the index, so it is never stale.
+otherwise (legacy meta, crash between writes, direct `add`) it recounts `index.json` (once per fingerprint, cached).
+This is best-effort, not a guarantee: `meta.json` is unauthenticated and the `[size, mtime_ns, inode]`
+fingerprint can in theory collide or be forged by anyone with write access to `INDEX_DIR`, so treat `index_size` as advisory.
+
+The lock file is opened with `O_NOFOLLOW` (mode 0600) and waiting is bounded (30s, then a clear `IndexLockTimeout`).
+`flock` is unreliable on NFS and some network filesystems; keep `INDEX_DIR` on a local disk.
 
 `constraints.txt` pins the tested dependency versions (regenerate with `pip list --format=freeze`); run `pip-audit` periodically.
 

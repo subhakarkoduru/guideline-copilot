@@ -8,7 +8,7 @@ from app.index import IndexCorruptError, InMemoryIndex
 from app.ingest import ingest, main, read_last_ingest
 from app.main import app
 
-TOKEN = "tttttttttttttttttttttttttttttttt"
+TOKEN = "k3J9xQ2mZ7vB1nL8wR4tY6uP0cD5aF_h"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
@@ -240,3 +240,69 @@ def test_lock_released_after_failed_ingest(index_dir, monkeypatch):
     monkeypatch.setenv("HEALTH_TOKEN", TOKEN)
     ingest(["b"], InMemoryIndex(index_dir), index_dir)
     assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == 2
+
+
+def test_lock_file_not_symlink_followed(tmp_path):
+    import os
+
+    import pytest
+
+    from app.index import index_lock
+
+    target = tmp_path / "victim"
+    target.write_text("keep")
+    d = tmp_path / "idx"
+    d.mkdir()
+    os.symlink(target, d / ".lock")
+    with pytest.raises(OSError):
+        with index_lock(str(d)):
+            pass
+    assert target.read_text() == "keep"
+
+
+def test_lock_file_mode_0600(tmp_path):
+    from app.index import index_lock
+
+    with index_lock(str(tmp_path)):
+        pass
+    assert (tmp_path / ".lock").stat().st_mode & 0o777 == 0o600
+
+
+def test_lock_timeout_raises_clear_error(tmp_path, monkeypatch):
+    import fcntl
+    import os
+
+    import pytest
+
+    import app.index as idx
+
+    monkeypatch.setattr(idx, "LOCK_TIMEOUT_SECONDS", 0.2)
+    fd = os.open(tmp_path / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(idx.IndexLockTimeout, match="timed out"):
+            with idx.index_lock(str(tmp_path)):
+                pass
+    finally:
+        os.close(fd)
+
+
+def test_drifted_fingerprint_parses_once(tmp_path, monkeypatch):
+    import app.ingest as ing
+    from app.index import InMemoryIndex
+
+    InMemoryIndex(str(tmp_path)).add(["a", "b"])  # no meta.json => drift
+    calls = []
+    orig = InMemoryIndex._load
+
+    def counting(self):
+        calls.append(1)
+        return orig(self)
+
+    monkeypatch.setattr(InMemoryIndex, "_load", counting)
+    ing._recount_cache.clear()
+    assert ing.read_index_size(str(tmp_path)) == 2
+    assert ing.read_index_size(str(tmp_path)) == 2
+    assert len(calls) == 1
+    InMemoryIndex(str(tmp_path)).add(["c"])  # new fingerprint => recount
+    assert ing.read_index_size(str(tmp_path)) == 3

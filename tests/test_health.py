@@ -8,7 +8,7 @@ from app.ingest import ingest
 from app.main import app, create_app
 
 
-TOKEN = "tttttttttttttttttttttttttttttttt"
+TOKEN = "k3J9xQ2mZ7vB1nL8wR4tY6uP0cD5aF_h"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
@@ -122,14 +122,11 @@ def test_short_health_token_rejected(monkeypatch):
         get_settings()
     with pytest.raises(ValidationError):
         create_app()
-    monkeypatch.setenv("HEALTH_TOKEN", "x" * 32)
-    assert get_settings().health_token == "x" * 32
+    ok = "k3J9xQ2mZ7vB1nL8wR4tY6uP0cD5aF_h"
+    monkeypatch.setenv("HEALTH_TOKEN", ok)
+    assert get_settings().health_token == ok
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="tester #1: whitespace-only/padded HEALTH_TOKEN is accepted but can never match an HTTP header",
-)
 def test_padded_or_blank_health_token_rejected(monkeypatch):
     from pydantic import ValidationError
 
@@ -139,3 +136,49 @@ def test_padded_or_blank_health_token_rejected(monkeypatch):
         monkeypatch.setenv("HEALTH_TOKEN", v)
         with pytest.raises(ValidationError):
             get_settings()
+
+
+def test_blank_or_padded_error_does_not_echo_value(monkeypatch):
+    from pydantic import ValidationError
+
+    from app.config import get_settings
+
+    monkeypatch.setenv("HEALTH_TOKEN", " secretvalue" + "z" * 30 + " ")
+    with pytest.raises(ValidationError) as ei:
+        get_settings()
+    assert "secretvalue" not in str(ei.value)
+
+
+def test_short_token_not_echoed_in_error(monkeypatch):
+    from pydantic import ValidationError
+
+    from app.config import get_settings
+
+    secret = "SuperSecret123"
+    monkeypatch.setenv("HEALTH_TOKEN", secret)
+    with pytest.raises(ValidationError) as ei:
+        get_settings()
+    assert secret not in str(ei.value)
+    assert "input_value" not in str(ei.value)
+
+
+def test_low_entropy_token_rejected_but_hex_ok(monkeypatch):
+    from pydantic import ValidationError
+
+    from app.config import get_settings
+
+    for v in ["x" * 32, "ab" * 16, "abc" * 11]:
+        monkeypatch.setenv("HEALTH_TOKEN", v)
+        with pytest.raises(ValidationError, match="repetitive"):
+            get_settings()
+    monkeypatch.setenv("HEALTH_TOKEN", "0123456789abcdef" * 4)
+    assert get_settings().health_token
+
+
+def test_bearer_scheme_case_insensitive(client):
+    c, _ = client
+    for scheme in ["bearer", "BEARER", "BeArEr"]:
+        r = c.get("/health", headers={"Authorization": f"{scheme} {TOKEN}"})
+        assert r.json()["model"] == "test-model"
+    assert c.get("/health", headers={"Authorization": f"bearer {TOKEN}x"}).json() == {"status": "ok"}
+    assert c.get("/health", headers={"Authorization": f"Basic {TOKEN}"}).json() == {"status": "ok"}

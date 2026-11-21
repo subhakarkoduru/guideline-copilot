@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional, Protocol
@@ -10,6 +11,20 @@ from typing import List, Optional, Protocol
 
 class IndexCorruptError(RuntimeError):
     """The persisted index exists but cannot be read or parsed."""
+
+
+class IndexLockTimeout(RuntimeError):
+    """Could not acquire the index lock within the timeout."""
+
+
+LOCK_TIMEOUT_SECONDS = 30.0
+_LOCK_POLL_SECONDS = 0.05
+
+
+def _open_lock_file(path: Path) -> int:
+    """Open the lock file without following symlinks, mode 0600."""
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    return os.open(path, flags, 0o600)
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -48,14 +63,28 @@ def index_lock(index_dir: str):
             held[key] -= 1
         return
     Path(index_dir).mkdir(parents=True, exist_ok=True)
-    with open(Path(index_dir) / ".lock", "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    fd = _open_lock_file(Path(index_dir) / ".lock")
+    try:
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise IndexLockTimeout(
+                        f"timed out after {LOCK_TIMEOUT_SECONDS}s waiting for index lock "
+                        f"{Path(index_dir) / '.lock'}; is another ingest running?"
+                    ) from None
+                time.sleep(_LOCK_POLL_SECONDS)
         held[key] = 1
         try:
             yield
         finally:
             held[key] = 0
-            fcntl.flock(f, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def index_signature(path: Path) -> Optional[list]:

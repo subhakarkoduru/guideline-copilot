@@ -23,9 +23,10 @@ def create_app() -> FastAPI:
         # No token configured => always minimal, regardless of APP_ENV.
         detailed = False
         if settings.health_token:
-            expected = f"Bearer {settings.health_token}"
-            detailed = authorization is not None and secrets.compare_digest(
-                authorization.encode(), expected.encode()
+            # Scheme is case-insensitive (RFC 7235); the token compare is constant-time.
+            scheme, _, supplied = (authorization or "").partition(" ")
+            detailed = scheme.lower() == "bearer" and secrets.compare_digest(
+                supplied.encode(), settings.health_token.encode()
             )
         if not detailed:
             return {"status": "ok"}
