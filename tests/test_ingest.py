@@ -220,3 +220,23 @@ def test_concurrent_processes_do_not_drop_documents(index_dir, tmp_path_factory)
         )
     assert all(p.wait() == 0 for p in procs)
     assert InMemoryIndex(index_dir).size() == 20
+
+
+def test_lock_released_after_failed_ingest(index_dir, monkeypatch):
+    import app.ingest as ing
+    from app.index import index_lock
+
+    def boom(path, text):
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(ing, "atomic_write_text", boom)
+    with pytest.raises(OSError):
+        ingest(["a"], InMemoryIndex(index_dir), index_dir)
+    monkeypatch.undo()
+    # the failed call must not leave the lock held
+    with index_lock(index_dir):
+        pass
+    monkeypatch.setenv("INDEX_DIR", index_dir)
+    monkeypatch.setenv("HEALTH_TOKEN", TOKEN)
+    ingest(["b"], InMemoryIndex(index_dir), index_dir)
+    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == 2

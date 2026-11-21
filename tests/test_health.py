@@ -124,3 +124,18 @@ def test_short_health_token_rejected(monkeypatch):
         create_app()
     monkeypatch.setenv("HEALTH_TOKEN", "x" * 32)
     assert get_settings().health_token == "x" * 32
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="tester #1: whitespace-only/padded HEALTH_TOKEN is accepted but can never match an HTTP header",
+)
+def test_padded_or_blank_health_token_rejected(monkeypatch):
+    from pydantic import ValidationError
+
+    from app.config import get_settings
+
+    for v in [" " * 32, "x" * 32 + " ", " " + "x" * 32]:
+        monkeypatch.setenv("HEALTH_TOKEN", v)
+        with pytest.raises(ValidationError):
+            get_settings()
