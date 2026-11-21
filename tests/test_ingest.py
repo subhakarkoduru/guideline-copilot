@@ -402,3 +402,47 @@ def test_cli_lock_timeout_reports_clean_error(index_dir, tmp_path, monkeypatch, 
         os.close(fd)
     err = capsys.readouterr().err
     assert "timed out" in err and "Traceback" not in err
+
+
+def test_dangling_symlinked_lock_refused_and_target_not_created(tmp_path):
+    # Tester #1 (round 5): a dangling symlink must not let open(O_CREAT) create the target.
+    import os
+
+    from app.index import index_lock
+
+    target = tmp_path / "ghost"
+    d = tmp_path / "idx"
+    d.mkdir()
+    os.symlink(target, d / ".lock")
+    with pytest.raises(IndexLockError, match="symbolic link"):
+        with index_lock(str(d)):
+            pass
+    assert not target.exists()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="tester #1 bug: ingest CLI catches only SettingsError; a non-secret invalid "
+    "setting (MAX_INGEST_BYTES=abc) escapes main() as a raw pydantic traceback (app/ingest.py:119)",
+)
+def test_cli_bad_non_secret_setting_reports_clean_error(index_dir, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MAX_INGEST_BYTES", "abc")
+    docs = tmp_path / "d.txt"
+    docs.write_text("x\n")
+    assert main(["app.ingest", str(docs)]) == 1
+    assert "Traceback" not in capsys.readouterr().err
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="tester #1 bug: OSError from mkdir/atomic write is not caught by ingest CLI main(); "
+    "INDEX_DIR pointing at a regular file gives a raw FileExistsError traceback",
+)
+def test_cli_index_dir_is_a_file_reports_clean_error(index_dir, tmp_path, monkeypatch, capsys):
+    not_a_dir = tmp_path / "afile"
+    not_a_dir.write_text("x")
+    monkeypatch.setenv("INDEX_DIR", str(not_a_dir))
+    docs = tmp_path / "d.txt"
+    docs.write_text("x\n")
+    assert main(["app.ingest", str(docs)]) == 1
+    assert "Traceback" not in capsys.readouterr().err

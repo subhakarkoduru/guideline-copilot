@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -237,3 +238,41 @@ def test_bearer_scheme_case_insensitive(client):
         assert r.json()["model"] == "test-model"
     assert c.get("/health", headers={"Authorization": f"bearer {TOKEN}x"}).json() == {"status": "ok"}
     assert c.get("/health", headers={"Authorization": f"Basic {TOKEN}"}).json() == {"status": "ok"}
+
+
+def test_token_match_is_case_sensitive(client):
+    # Tester #1 (round 5): only the scheme is case-insensitive, the token is not.
+    c, _ = client
+    assert c.get("/health", headers={"Authorization": f"Bearer {TOKEN.upper()}"}).json() == {"status": "ok"}
+
+
+def test_module_level_app_import_fails_fast_with_bad_token(tmp_path):
+    # Tester #1 (round 5): `uvicorn app.main:app` imports the module, which builds the
+    # app at import time. A bad HEALTH_TOKEN must abort the import with a secret-free error.
+    import os
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parent.parent
+    env = dict(os.environ, HEALTH_TOKEN="Zq8Lm2", INDEX_DIR=str(tmp_path))
+    proc = subprocess.run(
+        [sys.executable, "-c", "import app.main"],
+        cwd=root, env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode != 0
+    assert "SettingsError" in proc.stderr and "HEALTH_TOKEN" in proc.stderr
+    assert "Zq8Lm2" not in proc.stdout + proc.stderr
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="tester #1 bug: create_app(settings) skips validate_settings, so a Settings "
+    "object built in code can serve a short or weak HEALTH_TOKEN (app/main.py:13)",
+)
+def test_explicit_settings_object_is_validated():
+    from app.config import Settings, SettingsError
+
+    with pytest.raises(SettingsError):
+        create_app(Settings(health_token="short"))
+    with pytest.raises(SettingsError):
+        create_app(Settings(health_token="a" * 40))
