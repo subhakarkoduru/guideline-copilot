@@ -133,3 +133,17 @@ def test_cli_ingests_file_lines(tmp_path, monkeypatch, capsys):
     assert main(["app.ingest", str(docs)]) == 0
     assert "ingested 3 docs" in capsys.readouterr().out
     assert InMemoryIndex(str(tmp_path / "idx")).size() == 3
+
+
+def test_non_list_index_raises(index_dir):
+    open(f"{index_dir}/index.json", "w").write("{}")
+    with pytest.raises(IndexCorruptError, match="not a JSON list"):
+        InMemoryIndex(index_dir)
+
+
+def test_cli_non_utf8_input_fails(index_dir, tmp_path, capsys):
+    bad = tmp_path / "bad.txt"
+    bad.write_bytes(b"\xff\xfe\x00bad\n")
+    assert main(["app.ingest", str(bad)]) == 1
+    assert "error" in capsys.readouterr().err
+    assert InMemoryIndex(index_dir).size() == 0

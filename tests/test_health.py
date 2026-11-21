@@ -84,3 +84,11 @@ def test_docs_enabled_in_development(monkeypatch):
     monkeypatch.setenv("APP_ENV", "development")
     c = TestClient(create_app())
     assert c.get("/openapi.json").status_code == 200
+
+
+def test_health_token_takes_precedence_in_development(client, monkeypatch):
+    c, _ = client
+    monkeypatch.setenv("HEALTH_TOKEN", "s3cret")
+    # development alone would show details; with a token set, the token is required
+    assert c.get("/health").json() == {"status": "ok"}
+    assert c.get("/health", headers={"Authorization": "Bearer s3cret"}).json()["model"] == "test-model"
