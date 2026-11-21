@@ -1,3 +1,4 @@
+import errno
 import fcntl
 import json
 import os
@@ -13,7 +14,11 @@ class IndexCorruptError(RuntimeError):
     """The persisted index exists but cannot be read or parsed."""
 
 
-class IndexLockTimeout(RuntimeError):
+class IndexLockError(RuntimeError):
+    """The index lock could not be taken (bad lock file, timeout, ...)."""
+
+
+class IndexLockTimeout(IndexLockError):
     """Could not acquire the index lock within the timeout."""
 
 
@@ -24,7 +29,15 @@ _LOCK_POLL_SECONDS = 0.05
 def _open_lock_file(path: Path) -> int:
     """Open the lock file without following symlinks, mode 0600."""
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    return os.open(path, flags, 0o600)
+    try:
+        return os.open(path, flags, 0o600)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise IndexLockError(
+                f"lock file {path} is a symbolic link; refusing to follow it. "
+                "Remove it (and check who created it) and retry"
+            ) from e
+        raise IndexLockError(f"cannot open lock file {path}: {e.strerror or e}") from e
 
 
 def atomic_write_text(path: Path, text: str) -> None:

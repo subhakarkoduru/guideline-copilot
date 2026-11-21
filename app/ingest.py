@@ -1,12 +1,14 @@
 import json
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
-from app.config import get_settings
+from app.config import SettingsError, get_settings
 from app.index import (
     IndexCorruptError,
+    IndexLockError,
     InMemoryIndex,
     VectorIndex,
     atomic_write_text,
@@ -34,6 +36,7 @@ def read_last_ingest(index_dir: str) -> Optional[str]:
 # Recount cache keyed by (index_dir, fingerprint) so a drifted fingerprint costs
 # one full parse, not one per request. A new index.json write changes the key.
 _recount_cache: dict = {}
+_recount_lock = threading.Lock()  # guards check-and-fill so a drift is parsed once
 
 
 def read_index_size(index_dir: str) -> Optional[int]:
@@ -59,15 +62,16 @@ def read_index_size(index_dir: str) -> Optional[int]:
     ):
         return size
     key = (str(Path(index_dir).resolve()), tuple(sig))
-    if key in _recount_cache:
-        return _recount_cache[key]
-    try:
-        count = InMemoryIndex(index_dir).size()
-    except IndexCorruptError:
-        return None  # not cached: a fixed file changes the fingerprint anyway
-    _recount_cache.clear()  # keep at most one entry; bounded memory
-    _recount_cache[key] = count
-    return count
+    with _recount_lock:
+        if key in _recount_cache:
+            return _recount_cache[key]
+        try:
+            count = InMemoryIndex(index_dir).size()
+        except IndexCorruptError:
+            return None  # not cached: a fixed file changes the fingerprint anyway
+        _recount_cache.clear()  # keep at most one entry; bounded memory
+        _recount_cache[key] = count
+        return count
 
 
 def ingest(docs: List[str], index: VectorIndex, index_dir: str) -> Optional[str]:
@@ -111,7 +115,11 @@ def main(argv: List[str]) -> int:
     if len(argv) != 2:
         print("usage: python -m app.ingest <file-with-one-doc-per-line>")
         return 2
-    settings = get_settings()
+    try:
+        settings = get_settings()
+    except SettingsError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     try:
         text = read_bounded(Path(argv[1]), settings.max_ingest_bytes)
     except FileNotFoundError:
@@ -123,7 +131,7 @@ def main(argv: List[str]) -> int:
     docs = [ln for ln in text.splitlines() if ln.strip()]
     try:
         ingest(docs, InMemoryIndex(settings.index_dir), settings.index_dir)
-    except IndexCorruptError as e:
+    except (IndexCorruptError, IndexLockError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     print(f"ingested {len(docs)} docs")

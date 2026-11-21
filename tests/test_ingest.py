@@ -5,9 +5,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.index import IndexCorruptError, InMemoryIndex
+from app.index import IndexCorruptError, IndexLockError, InMemoryIndex
 from app.ingest import ingest, main, read_last_ingest
-from app.main import app
+from app.main import create_app
 
 TOKEN = "k3J9xQ2mZ7vB1nL8wR4tY6uP0cD5aF_h"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -23,7 +23,7 @@ def index_dir(tmp_path, monkeypatch):
 
 
 def test_default_model_name_when_env_unset(index_dir):
-    body = TestClient(app).get("/health", headers=AUTH).json()
+    body = TestClient(create_app()).get("/health", headers=AUTH).json()
     assert body["model"] == "claude-sonnet-5-5"
 
 
@@ -31,7 +31,7 @@ def test_index_size_accumulates_across_ingests(index_dir):
     ingest(["a", "b"], InMemoryIndex(index_dir), index_dir)
     first = read_last_ingest(index_dir)
     ingest(["c"], InMemoryIndex(index_dir), index_dir)
-    body = TestClient(app).get("/health", headers=AUTH).json()
+    body = TestClient(create_app()).get("/health", headers=AUTH).json()
     assert body["index_size"] == 3
     assert body["last_ingest_at"] >= first
 
@@ -42,7 +42,7 @@ def test_corrupt_index_raises_and_is_not_overwritten(index_dir):
     with pytest.raises(IndexCorruptError):
         InMemoryIndex(index_dir)
     # health does not touch the index, so it still works
-    assert TestClient(app).get("/health", headers=AUTH).status_code == 200
+    assert TestClient(create_app()).get("/health", headers=AUTH).status_code == 200
     assert open(p).read() == "{not json"
 
 
@@ -103,7 +103,7 @@ def test_cli_rejects_directory(index_dir, tmp_path, capsys):
 
 def test_corrupt_meta_file_reports_null_last_ingest(index_dir):
     (open(f"{index_dir}/meta.json", "w")).write("garbage")
-    body = TestClient(app).get("/health", headers=AUTH).json()
+    body = TestClient(create_app()).get("/health", headers=AUTH).json()
     assert body["last_ingest_at"] is None
 
 
@@ -157,14 +157,14 @@ def test_cli_non_utf8_input_fails(index_dir, tmp_path, capsys):
 def test_legacy_meta_without_index_size_falls_back_to_count(index_dir):
     open(f"{index_dir}/index.json", "w").write('["x", "y"]')
     open(f"{index_dir}/meta.json", "w").write('{"last_ingest_at": "2024-01-01T00:00:00+00:00"}')
-    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == 2
+    assert TestClient(create_app()).get("/health", headers=AUTH).json()["index_size"] == 2
 
 
 def test_direct_add_after_ingest_does_not_leave_stale_size(index_dir):
     # Tester repro: index.json changes without meta.json being updated.
     ingest(["a"], InMemoryIndex(index_dir), index_dir)
     InMemoryIndex(index_dir).add(["b", "c"])
-    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == 3
+    assert TestClient(create_app()).get("/health", headers=AUTH).json()["index_size"] == 3
 
 
 def test_crash_between_index_and_meta_writes_is_consistent(index_dir, monkeypatch):
@@ -181,7 +181,7 @@ def test_crash_between_index_and_meta_writes_is_consistent(index_dir, monkeypatc
     monkeypatch.undo()
     monkeypatch.setenv("INDEX_DIR", index_dir)
     monkeypatch.setenv("HEALTH_TOKEN", TOKEN)
-    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == 3
+    assert TestClient(create_app()).get("/health", headers=AUTH).json()["index_size"] == 3
 
 
 def test_concurrent_ingests_do_not_drop_documents(index_dir):
@@ -204,7 +204,7 @@ def test_concurrent_ingests_do_not_drop_documents(index_dir):
     [t.join() for t in ts]
     assert not errors
     assert InMemoryIndex(index_dir).size() == n_threads * per
-    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == n_threads * per
+    assert TestClient(create_app()).get("/health", headers=AUTH).json()["index_size"] == n_threads * per
 
 
 def test_concurrent_processes_do_not_drop_documents(index_dir, tmp_path_factory):
@@ -240,7 +240,7 @@ def test_lock_released_after_failed_ingest(index_dir, monkeypatch):
     monkeypatch.setenv("INDEX_DIR", index_dir)
     monkeypatch.setenv("HEALTH_TOKEN", TOKEN)
     ingest(["b"], InMemoryIndex(index_dir), index_dir)
-    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == 2
+    assert TestClient(create_app()).get("/health", headers=AUTH).json()["index_size"] == 2
 
 
 def test_lock_file_not_symlink_followed(tmp_path):
@@ -255,10 +255,65 @@ def test_lock_file_not_symlink_followed(tmp_path):
     d = tmp_path / "idx"
     d.mkdir()
     os.symlink(target, d / ".lock")
-    with pytest.raises(OSError):
+    with pytest.raises(IndexLockError, match="symbolic link") as ei:
         with index_lock(str(d)):
             pass
+    assert str(d / ".lock") in str(ei.value)
     assert target.read_text() == "keep"
+
+
+def test_cli_symlinked_lock_reports_clean_error(index_dir, tmp_path, capsys):
+    import os
+
+    victim = tmp_path / "victim"
+    victim.write_text("keep")
+    os.symlink(victim, Path(index_dir) / ".lock")
+    docs = tmp_path / "d.txt"
+    docs.write_text("x\n")
+    assert main(["app.ingest", str(docs)]) == 1
+    err = capsys.readouterr().err
+    assert "symbolic link" in err and "Traceback" not in err
+    assert victim.read_text() == "keep"
+
+
+def test_cli_bad_health_token_reports_clean_error(index_dir, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HEALTH_TOKEN", "short-secret-xyz")
+    docs = tmp_path / "d.txt"
+    docs.write_text("x\n")
+    assert main(["app.ingest", str(docs)]) == 1
+    err = capsys.readouterr().err
+    assert "HEALTH_TOKEN" in err and "short-secret-xyz" not in err
+
+
+def test_concurrent_recount_parses_once(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    import app.ingest as ing
+
+    InMemoryIndex(str(tmp_path)).add(["a", "b"])  # no meta => drift
+    calls = []
+    orig = InMemoryIndex._load
+
+    def slow(self):
+        calls.append(1)
+        time.sleep(0.2)
+        return orig(self)
+
+    monkeypatch.setattr(InMemoryIndex, "_load", slow)
+    ing._recount_cache.clear()
+    results = []
+    start = threading.Barrier(8)
+
+    def worker():
+        start.wait()
+        results.append(ing.read_index_size(str(tmp_path)))
+
+    ts = [threading.Thread(target=worker) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert results == [2] * 8
+    assert len(calls) == 1
 
 
 def test_lock_file_mode_0600(tmp_path):
@@ -313,7 +368,7 @@ def test_corrupt_index_health_reports_null_index_size(index_dir):
     # Tester addition: an unreadable index must surface as null, not a stale number.
     ingest(["a"], InMemoryIndex(index_dir), index_dir)
     open(f"{index_dir}/index.json", "w").write("{bad json")
-    body = TestClient(app).get("/health", headers=AUTH).json()
+    body = TestClient(create_app()).get("/health", headers=AUTH).json()
     assert body["status"] == "ok"
     assert body["index_size"] is None
 
@@ -327,13 +382,9 @@ def test_invalid_recorded_size_falls_back_to_count(index_dir, bad_size):
     sig = index_signature(Path(index_dir) / "index.json")
     meta = {"last_ingest_at": "2024-01-01T00:00:00+00:00", "index_size": bad_size, "index_sig": sig}
     open(f"{index_dir}/meta.json", "w").write(json.dumps(meta))
-    assert TestClient(app).get("/health", headers=AUTH).json()["index_size"] == 2
+    assert TestClient(create_app()).get("/health", headers=AUTH).json()["index_size"] == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="known gap: ingest CLI does not catch IndexLockTimeout (raw traceback, exit 1)",
-)
 def test_cli_lock_timeout_reports_clean_error(index_dir, tmp_path, monkeypatch, capsys):
     import fcntl
     import os

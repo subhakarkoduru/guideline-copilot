@@ -3,13 +3,17 @@ from typing import Optional
 
 from fastapi import FastAPI, Header
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.ingest import read_index_size, read_last_ingest
 
 
-def create_app() -> FastAPI:
+def create_app(settings: Optional[Settings] = None) -> FastAPI:
+    # Settings are read and validated ONCE here (startup), so a bad config fails fast
+    # with a clear error and can never turn into per-request 500s.
+    settings = settings or get_settings()
+    token = settings.health_token_value()
     # Interactive docs / schema only in development.
-    dev = get_settings().is_dev
+    dev = settings.is_dev
     app = FastAPI(
         title="Guideline Copilot",
         docs_url="/docs" if dev else None,
@@ -19,14 +23,13 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     def health(authorization: Optional[str] = Header(default=None)) -> dict:
-        settings = get_settings()
         # No token configured => always minimal, regardless of APP_ENV.
         detailed = False
-        if settings.health_token:
+        if token:
             # Scheme is case-insensitive (RFC 7235); the token compare is constant-time.
             scheme, _, supplied = (authorization or "").partition(" ")
             detailed = scheme.lower() == "bearer" and secrets.compare_digest(
-                supplied.encode(), settings.health_token.encode()
+                supplied.encode(), token.encode()
             )
         if not detailed:
             return {"status": "ok"}

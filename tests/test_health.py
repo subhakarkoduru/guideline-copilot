@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.index import InMemoryIndex
 from app.ingest import ingest
-from app.main import app, create_app
+from app.main import create_app
 
 
 TOKEN = "k3J9xQ2mZ7vB1nL8wR4tY6uP0cD5aF_h"
@@ -18,7 +18,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_NAME", "test-model")
     monkeypatch.setenv("APP_ENV", "development")
     monkeypatch.setenv("HEALTH_TOKEN", TOKEN)
-    return TestClient(app), str(tmp_path)
+    return TestClient(create_app()), str(tmp_path)
 
 
 def test_health_empty(client):
@@ -45,6 +45,7 @@ def test_health_after_ingest(client):
 def test_model_env_override(client, monkeypatch):
     c, _ = client
     monkeypatch.setenv("MODEL_NAME", "other-model")
+    c = TestClient(create_app())  # settings are read once, at startup
     assert c.get("/health", headers=AUTH).json()["model"] == "other-model"
 
 
@@ -52,7 +53,7 @@ def test_health_minimal_in_production_without_token(tmp_path, monkeypatch):
     monkeypatch.setenv("INDEX_DIR", str(tmp_path))
     monkeypatch.delenv("APP_ENV", raising=False)
     monkeypatch.delenv("HEALTH_TOKEN", raising=False)
-    assert TestClient(app).get("/health").json() == {"status": "ok"}
+    assert TestClient(create_app()).get("/health").json() == {"status": "ok"}
 
 
 def test_health_token_gates_details(client):
@@ -109,70 +110,124 @@ def test_empty_token_treated_as_unset(tmp_path, monkeypatch):
     monkeypatch.setenv("INDEX_DIR", str(tmp_path))
     monkeypatch.setenv("APP_ENV", "development")
     monkeypatch.setenv("HEALTH_TOKEN", "")
-    assert TestClient(app).get("/health", headers={"Authorization": "Bearer "}).json() == {"status": "ok"}
+    assert TestClient(create_app()).get("/health", headers={"Authorization": "Bearer "}).json() == {"status": "ok"}
+
+
+def _bad(monkeypatch, value):
+    from app.config import SettingsError, get_settings
+
+    monkeypatch.setenv("HEALTH_TOKEN", value)
+    with pytest.raises(SettingsError) as ei:
+        get_settings()
+    return ei.value
 
 
 def test_short_health_token_rejected(monkeypatch):
-    from pydantic import ValidationError
-
     from app.config import get_settings
 
-    monkeypatch.setenv("HEALTH_TOKEN", "x" * 31)
-    with pytest.raises(ValidationError, match="at least 32"):
-        get_settings()
-    with pytest.raises(ValidationError):
-        create_app()
+    err = _bad(monkeypatch, "x" * 31)
+    assert "at least 32" in str(err)
     ok = "k3J9xQ2mZ7vB1nL8wR4tY6uP0cD5aF_h"
     monkeypatch.setenv("HEALTH_TOKEN", ok)
-    assert get_settings().health_token == ok
+    assert get_settings().health_token_value() == ok
 
 
-def test_padded_or_blank_health_token_rejected(monkeypatch):
+def test_bad_token_fails_at_startup_not_per_request(monkeypatch):
+    from app.config import SettingsError
+
+    monkeypatch.setenv("HEALTH_TOKEN", "short")
+    with pytest.raises(SettingsError, match="HEALTH_TOKEN"):
+        create_app()  # fail fast, before any request can exist
+
+
+def test_env_change_after_startup_cannot_cause_500(tmp_path, monkeypatch):
+    monkeypatch.setenv("INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("HEALTH_TOKEN", TOKEN)
+    c = TestClient(create_app())
+    monkeypatch.setenv("HEALTH_TOKEN", "bad")  # settings are not re-read per request
+    assert c.get("/health").status_code == 200
+    assert c.get("/health", headers=AUTH).status_code == 200
+
+
+@pytest.mark.parametrize("v", [" " * 32, "x" * 32 + " ", " " + "x" * 32, "\t" * 32])
+def test_padded_or_blank_health_token_rejected(monkeypatch, v):
+    _bad(monkeypatch, v)
+
+
+@pytest.mark.parametrize(
+    "v",
+    [
+        "k3J9xQ2mZ7vB1nL8wR4tY6u\nP0cD5aF_h",
+        "k3J9xQ2mZ7vB1nL8wR4tY6u\tP0cD5aF_h",
+        "k3J9xQ2mZ7vB1nL8wR4tY6u P0cD5aF_h",
+        "k3J9xQ2mZ7vB1nL8wR4tY6u\u00e9P0cD5aF_h",
+    ],
+)
+def test_health_token_with_internal_control_chars_rejected(monkeypatch, v):
+    _bad(monkeypatch, v)
+
+
+def test_token_not_in_error_string_or_errors_list(monkeypatch):
+    import json
+
     from pydantic import ValidationError
 
-    from app.config import get_settings
+    from app.config import Settings, SettingsError, get_settings
 
-    for v in [" " * 32, "x" * 32 + " ", " " + "x" * 32]:
-        monkeypatch.setenv("HEALTH_TOKEN", v)
-        with pytest.raises(ValidationError):
+    for secret in ["SuperSecret123", " secretvalue" + "z" * 30 + " ", "abcdefgh" * 4]:
+        monkeypatch.setenv("HEALTH_TOKEN", secret)
+        with pytest.raises(SettingsError) as ei:
             get_settings()
-
-
-def test_blank_or_padded_error_does_not_echo_value(monkeypatch):
-    from pydantic import ValidationError
-
-    from app.config import get_settings
-
-    monkeypatch.setenv("HEALTH_TOKEN", " secretvalue" + "z" * 30 + " ")
+        e = ei.value
+        for text in (str(e), repr(e), repr(e.args), repr(e.__cause__), repr(e.__context__)):
+            assert secret.strip() not in text
+        assert not isinstance(e, ValidationError)  # no .errors() carrying the input
+    # the raw Settings object masks the secret too
+    monkeypatch.setenv("HEALTH_TOKEN", "SuperSecret123")
+    s = Settings()
+    assert "SuperSecret123" not in repr(s) and "SuperSecret123" not in str(s)
+    # other-field validation errors cannot carry the token either
+    monkeypatch.setenv("MAX_INGEST_BYTES", "notanint")
     with pytest.raises(ValidationError) as ei:
-        get_settings()
-    assert "secretvalue" not in str(ei.value)
+        Settings()
+    assert "SuperSecret123" not in str(ei.value)
+    assert "SuperSecret123" not in json.dumps(ei.value.errors(), default=str)
 
 
-def test_short_token_not_echoed_in_error(monkeypatch):
-    from pydantic import ValidationError
+@pytest.mark.parametrize(
+    "v",
+    [
+        "x" * 32,
+        "ab" * 16,
+        "abc" * 11,
+        "abcdefgh" * 4,  # 8 distinct, periodic
+        "xY9#kL2@" * 4,
+        "xY9#kL2@pQ" * 4,
+        "abcdefghijklmnopqrstuvwxyz012345",  # sequential
+        "0123456789abcdef" * 2,
+        "a" * 14 + "k3J9xQ2mZ7vB1nL8wR",  # one char dominates
+        "k3J9xQ2mZ7vB1nL8wR4tY6u" * 2 + "k3J9",  # repeated block with a ragged tail
+    ],
+)
+def test_weak_tokens_rejected(monkeypatch, v):
+    assert "too weak" in str(_bad(monkeypatch, v))
 
-    from app.config import get_settings
 
-    secret = "SuperSecret123"
-    monkeypatch.setenv("HEALTH_TOKEN", secret)
-    with pytest.raises(ValidationError) as ei:
-        get_settings()
-    assert secret not in str(ei.value)
-    assert "input_value" not in str(ei.value)
+def test_realistic_tokens_accepted():
+    import base64
+    import os
 
+    from app.config import health_token_problem
 
-def test_low_entropy_token_rejected_but_hex_ok(monkeypatch):
-    from pydantic import ValidationError
-
-    from app.config import get_settings
-
-    for v in ["x" * 32, "ab" * 16, "abc" * 11]:
-        monkeypatch.setenv("HEALTH_TOKEN", v)
-        with pytest.raises(ValidationError, match="repetitive"):
-            get_settings()
-    monkeypatch.setenv("HEALTH_TOKEN", "0123456789abcdef" * 4)
-    assert get_settings().health_token
+    for _ in range(3000):
+        for tok in (
+            os.urandom(32).hex(),
+            os.urandom(16).hex(),  # 32 hex chars, the shortest allowed
+            base64.b64encode(os.urandom(32)).decode(),
+            base64.urlsafe_b64encode(os.urandom(32)).decode(),
+        ):
+            assert health_token_problem(tok) is None, tok
+    assert health_token_problem(TOKEN) is None
 
 
 def test_bearer_scheme_case_insensitive(client):
@@ -182,18 +237,3 @@ def test_bearer_scheme_case_insensitive(client):
         assert r.json()["model"] == "test-model"
     assert c.get("/health", headers={"Authorization": f"bearer {TOKEN}x"}).json() == {"status": "ok"}
     assert c.get("/health", headers={"Authorization": f"Basic {TOKEN}"}).json() == {"status": "ok"}
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="known gap: validator accepts internal control characters/newlines, which "
-    "no HTTP Authorization header can carry, so the token silently never matches",
-)
-def test_health_token_with_internal_control_chars_rejected(monkeypatch):
-    from pydantic import ValidationError
-
-    from app.config import get_settings
-
-    monkeypatch.setenv("HEALTH_TOKEN", "k3J9xQ2mZ7vB1nL8wR4tY6u\nP0cD5aF_h")
-    with pytest.raises(ValidationError):
-        get_settings()
